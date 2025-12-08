@@ -1,161 +1,148 @@
 package main
 
 import (
-	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
-	"os"
-	"sync"
 
-	"github.com/joho/godotenv"
+	"github.com/gin-gonic/gin"
+	"github.com/go-resty/resty/v2"
 )
 
 var (
-	shopTokens = struct {
-		sync.RWMutex
-		m map[string]string
-	}{m: make(map[string]string)}
+	SHOPIFY_CLIENT_ID     = "f3b6cde13bc22652403e31ab2e5f24b9"
+	SHOPIFY_CLIENT_SECRET = "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"
+
+	// Map lưu token in-memory
+	tokenStore = map[string]string{}
 )
 
+func randomState() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 func main() {
-	// load .env
-	_ = godotenv.Load()
+	r := gin.Default()
 
-	apiKey := os.Getenv("SHOPIFY_API_KEY")
-	apiSecret := os.Getenv("SHOPIFY_API_SECRET")
-	appHost := os.Getenv("APP_HOST") // e.g. https://abcd.ngrok.io or https://your-domain.com
-	if apiKey == "" || apiSecret == "" || appHost == "" {
-		log.Fatal("Please set SHOPIFY_API_KEY, SHOPIFY_API_SECRET, APP_HOST in env")
-	}
+	// ============================
+	// 1. BẮT ĐẦU OAUTH
+	// ============================
+	r.GET("/auth", func(c *gin.Context) {
+		shop := c.Query("shop")
+		if shop == "" {
+			c.String(400, "Thiếu tham số shop: ?shop=yourstore.myshopify.com")
+			return
+		}
 
-	http.HandleFunc("/", handleIndex)
-	http.HandleFunc("/auth", func(w http.ResponseWriter, r *http.Request) {
-		handleAuth(w, r, apiKey, appHost)
+		state := randomState()
+		redirectUri := "http://localhost:3000/auth/callback"
+
+		installUrl := fmt.Sprintf(
+			"https://%s/admin/oauth/authorize?client_id=%s&scope=read_products,write_products&redirect_uri=%s&state=%s",
+			shop,
+			SHOPIFY_CLIENT_ID,
+			redirectUri,
+			state,
+		)
+
+		c.Redirect(http.StatusFound, installUrl)
 	})
-	http.HandleFunc("/auth/callback", func(w http.ResponseWriter, r *http.Request) {
-		handleAuthCallback(w, r, apiKey, apiSecret)
-	})
-	http.HandleFunc("/api/products", handleProducts)
 
-	addr := ":8080"
-	log.Printf("BE listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	// ============================
+	// 2. NHẬN CODE VÀ LẤY TOKEN
+	// ============================
+	r.GET("/auth/callback", func(c *gin.Context) {
+		shop := c.Query("shop")
+		code := c.Query("code")
+
+		if shop == "" || code == "" {
+			c.String(400, "Thiếu shop hoặc code")
+			return
+		}
+
+		client := resty.New()
+		resp, err := client.R().
+			SetHeader("Content-Type", "application/json").
+			SetBody(map[string]interface{}{
+				"client_id":     SHOPIFY_CLIENT_ID,
+				"client_secret": SHOPIFY_CLIENT_SECRET,
+				"code":          code,
+			}).
+			Post(fmt.Sprintf("https://%s/admin/oauth/access_token", shop))
+
+		if err != nil {
+			c.String(500, "Lỗi gọi Shopify API: %v", err)
+			return
+		}
+
+		var data struct {
+			AccessToken string `json:"access_token"`
+		}
+		if err := json.Unmarshal(resp.Body(), &data); err != nil {
+			c.String(500, "Lỗi đọc response: %v", err)
+			return
+		}
+
+		// Lưu token vào map
+		tokenStore[shop] = data.AccessToken
+
+		c.Header("Content-Type", "text/html")
+		c.String(200, `
+			<h2>Install thành công!</h2>
+			<p>Shop: %s</p>
+			<p>Access Token: %s</p>
+			<p><a href="/tokens">Xem tất cả tokens</a></p>
+			<p><a href="/products?shop=%s">Lấy danh sách products</a></p>
+		`, shop, data.AccessToken)
+	})
+
+	// ============================
+	// 3. XEM TOÀN BỘ TOKEN
+	// ============================
+	r.GET("/tokens", func(c *gin.Context) {
+		c.JSON(200, tokenStore)
+	})
+
+	fmt.Println("Server chạy tại http://localhost:3000")
+	r.Run(":3000")
 }
 
-func handleIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html")
-	fmt.Fprintf(w, `<h2>Shopify App Backend (Demo)</h2>
-<p>To install, open this URL (replace <em>{shop}</em>):</p>
-<pre>%s/auth?shop={shop}.myshopify.com</pre>
-<p>Example: <a href="%s/auth?shop=your-store.myshopify.com">%s/auth?shop=your-store.myshopify.com</a></p>
-`, r.Host, r.Host, r.Host)
-}
-
-// /auth?shop=the-shop.myshopify.com
-func handleAuth(w http.ResponseWriter, r *http.Request, apiKey, appHost string) {
+// Lấy danh sách products
+func productsHandler(w http.ResponseWriter, r *http.Request) {
 	shop := r.URL.Query().Get("shop")
 	if shop == "" {
-		http.Error(w, "missing shop", http.StatusBadRequest)
+		http.Error(w, "Missing shop parameter", http.StatusBadRequest)
 		return
 	}
 
-	// create state (simple random string). For demo we won't store persistent state
-	state := "statedemo" // in production generate random and store in cookie/session
-	redirectURI := fmt.Sprintf("%s/auth/callback", appHost)
-
-	scope := "read_products,write_products" // adjust scopes
-	installURL := fmt.Sprintf("https://%s/admin/oauth/authorize?client_id=%s&scope=%s&redirect_uri=%s&state=%s",
-		shop, apiKey, scope, redirectURI, state)
-
-	http.Redirect(w, r, installURL, http.StatusFound)
-}
-
-// /auth/callback?code=...&shop=...&state=...
-func handleAuthCallback(w http.ResponseWriter, r *http.Request, apiKey, apiSecret string) {
-	shop := r.URL.Query().Get("shop")
-	code := r.URL.Query().Get("code")
-	state := r.URL.Query().Get("state")
-
-	if shop == "" || code == "" {
-		http.Error(w, "missing params", http.StatusBadRequest)
+	token, ok := tokenStore[shop]
+	if !ok {
+		http.Error(w, "Token not found for shop", http.StatusNotFound)
 		return
 	}
-	_ = state // for demo skip verifying
 
-	// Exchange code for access token
-	url := fmt.Sprintf("https://%s/admin/oauth/access_token", shop)
-	body := map[string]string{
-		"client_id":     apiKey,
-		"client_secret": apiSecret,
-		"code":          code,
-	}
-	bts, _ := json.Marshal(body)
-	resp, err := http.Post(url, "application/json", bytes.NewReader(bts))
+	url := fmt.Sprintf("https://%s/admin/api/2024-01/products.json", shop)
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		http.Error(w, "token exchange failed: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	req.Header.Add("X-Shopify-Access-Token", token)
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
 
-	if resp.StatusCode != 200 {
-		http.Error(w, "token exchange failed: "+string(respBody), http.StatusInternalServerError)
-		return
-	}
-
-	var parsed struct {
-		AccessToken string `json:"access_token"`
-		Scope       string `json:"scope"`
-	}
-	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		http.Error(w, "invalid token response: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// store token in memory (demo)
-	shopTokens.Lock()
-	shopTokens.m[shop] = parsed.AccessToken
-	shopTokens.Unlock()
-
-	// After successful install, redirect to your app FE (Shopify will call with host param if embedded)
-	// We redirect to frontend app url (APP_HOST). Add ?shop=... so FE knows the shop
-	appHost := os.Getenv("APP_HOST")
-	redirectTo := fmt.Sprintf("%s?shop=%s", appHost, shop)
-	http.Redirect(w, r, redirectTo, http.StatusFound)
-}
-
-// /api/products?shop=...
-// Expect Authorization: Bearer <session-token> from FE. For demo, we only check that a token exists for the shop.
-func handleProducts(w http.ResponseWriter, r *http.Request) {
-	shop := r.URL.Query().Get("shop")
-	if shop == "" {
-		http.Error(w, "missing shop query", http.StatusBadRequest)
-		return
-	}
-
-	// Validate that shop is installed (has an access token in memory)
-	shopTokens.RLock()
-	_, ok := shopTokens.m[shop]
-	shopTokens.RUnlock()
-	if !ok {
-		http.Error(w, "shop not installed", http.StatusUnauthorized)
-		return
-	}
-
-	// (In production) verify session token from Authorization header. For demo we skip deep verification.
-	// Return fake products
-	fakeProducts := []map[string]interface{}{
-		{"id": 1, "title": "Demo Product A", "price": "99.00"},
-		{"id": 2, "title": "Demo Product B", "price": "149.00"},
-	}
-
-	resp := map[string]interface{}{
-		"products": fakeProducts,
-	}
-
+	body, _ := io.ReadAll(resp.Body)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	w.Write(body)
 }
