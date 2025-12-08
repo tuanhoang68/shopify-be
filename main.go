@@ -10,8 +10,8 @@ import (
 )
 
 var (
-	SHOPIFY_CLIENT_ID     = "f3b6cde13bc22652403e31ab2e5f24b9"
-	SHOPIFY_CLIENT_SECRET = "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"
+	SHOPIFY_CLIENT_ID     = "SHOPIFY_CLIENT_ID"
+	SHOPIFY_CLIENT_SECRET = "SHOPIFY_CLIENT_SECRET"
 	APP_URL               = "http://localhost:3000"
 )
 
