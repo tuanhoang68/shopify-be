@@ -9,11 +9,11 @@ import (
 	"net/url"
 )
 
-//var (
-//	SHOPIFY_CLIENT_ID     = "SHOPIFY_CLIENT_ID"
-//	SHOPIFY_CLIENT_SECRET = "SHOPIFY_CLIENT_SECRET"
-//	APP_URL               = "http://localhost:3000"
-//)
+var (
+	SHOPIFY_CLIENT_ID     = "SHOPIFY_CLIENT_ID"
+	SHOPIFY_CLIENT_SECRET = "SHOPIFY_CLIENT_SECRET"
+	APP_URL               = "http://localhost:3000"
+)
 
 // Lưu token tạm trong RAM
 var tokenStore = make(map[string]string)
